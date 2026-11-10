@@ -404,6 +404,26 @@ function withMirrorLock<T>(session: Session, run: () => Promise<T>): Promise<T> 
   return next;
 }
 
+// Threads already told (by this bridge process) that a read left older history out, so
+// the follower's 5 s ticks don't repeat the note while the conversation stays too big.
+const OMISSION_NOTED = new Set<string>();
+
+function omissionNote(): ThreadDelta[] {
+  const key = { providerItemId: `grok-bot-omitted-${randomUUID().slice(0, 8)}` };
+  const text =
+    "Older Grok Bot history was left out: this conversation is too big for one read " +
+    "(gbot caps a read at 1 MB), so BB shows only the newest messages that fit.";
+  return [
+    {
+      kind: "item.open",
+      key,
+      item: { type: "agentMessage", text: "" },
+      presentation: BOT_MESSAGE_PRESENTATION,
+    },
+    { kind: "item.textClose", key, channel: "agentMessage", text },
+  ];
+}
+
 // Reads every Grok entry bb hasn't shown yet and returns the deltas that show them,
 // committing the cursor only through `commit` once the deltas are on the wire.
 async function pullTranscript(args: {
@@ -428,6 +448,10 @@ async function pullTranscript(args: {
   const deltas: ThreadDelta[] = [];
   for (let page = 0; page < MAX_PAGES_PER_PULL; page += 1) {
     const result = await readThread(gbot, agentId, backfill ? null : state.cursor, args.signal);
+    if (result.omittedOlder && (backfill || !OMISSION_NOTED.has(session.threadId))) {
+      OMISSION_NOTED.add(session.threadId);
+      deltas.push(...omissionNote());
+    }
     for (const entry of result.entries) {
       const seq = entrySeq(entry);
       if (seq !== null && state.lastSeq !== null && seq <= state.lastSeq) continue;

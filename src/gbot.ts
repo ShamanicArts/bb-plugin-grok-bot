@@ -292,20 +292,43 @@ const threadResultSchema = z
   })
   .passthrough();
 
+// gbot renders every result as an Agent Document capped at 1 MiB (agent-bundle's
+// maxDocumentBytes, 1048576). A big conversation, or a few huge entries, can push the
+// tail past it, and gbot then fails the whole read with "Agent Document bytes exceed".
+// Ask for fewer trailing entries until one fits, and flag that older history was left out.
+const DOCUMENT_TOO_BIG_RE = /document-bytes-exceeded|Agent Document bytes exceed/;
+const THREAD_READ_LIMITS = [200, 100, 50, 20, 5, 1] as const;
+
 export async function readThread(
   gbot: string,
   agentId: string,
   after: string | null,
   signal?: AbortSignal,
-): Promise<{ entries: TranscriptEntry[]; cursor: string | null; gapReset: boolean }> {
-  const args = ["thread", agentId, "--no-history", "--limit", "200"];
-  if (after) args.push("--after", after);
-  const result = await gbotJson(gbot, args, threadResultSchema, signal);
-  return {
-    entries: result.transcript.entries,
-    cursor: result.cursor ?? null,
-    gapReset: result.gapReset === true,
-  };
+): Promise<{
+  entries: TranscriptEntry[];
+  cursor: string | null;
+  gapReset: boolean;
+  omittedOlder: boolean;
+}> {
+  for (const limit of THREAD_READ_LIMITS) {
+    const args = ["thread", agentId, "--no-history", "--limit", String(limit)];
+    if (after) args.push("--after", after);
+    try {
+      const result = await gbotJson(gbot, args, threadResultSchema, signal);
+      return {
+        entries: result.transcript.entries,
+        cursor: result.cursor ?? null,
+        gapReset: result.gapReset === true,
+        omittedOlder: limit < THREAD_READ_LIMITS[0],
+      };
+    } catch (error) {
+      if (!(error instanceof GbotError) || !DOCUMENT_TOO_BIG_RE.test(error.message)) {
+        throw error;
+      }
+    }
+  }
+  // Even the newest entry alone is over the cap: show nothing rather than fail the turn.
+  return { entries: [], cursor: after, gapReset: false, omittedOlder: true };
 }
 
 const doctorSchema = z
