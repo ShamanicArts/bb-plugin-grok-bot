@@ -77,6 +77,7 @@ interface Session {
 
 const FOLLOW_INTERVAL_MS = 5_000;
 const MAX_PAGES_PER_PULL = 10;
+const PRE_SEND_DRAIN_MS = 8_000;
 const BB_SYSTEM_PREFIX = "[bb system]";
 
 const sessions = new Map<string, Session>();
@@ -618,17 +619,27 @@ async function runTurn(args: {
     followLater(session);
   };
 
-  let agent: GrokAgent;
+  // Only the bot's name is needed here. Use the cached one when we have it: a roster
+  // read can time out while the bot is busy, and that must not stop the send.
+  let agent: Pick<GrokAgent, "name">;
   try {
-    agent = await getAgent(gbot, agentId, turn.abort.signal);
+    const known = BOT_NAMES.get(agentId);
+    agent = known !== undefined ? { name: known } : await getAgent(gbot, agentId, turn.abort.signal);
     BOT_NAMES.set(agentId, agent.name);
-    // Anything already in Grok that bb hasn't shown (the history on a new thread,
-    // messages typed in the Grok Bot app) lands before this turn's own traffic.
-    await drain();
   } catch (error) {
     if (!turn.cancelled) fail(errorMessage(error));
     return;
   }
+  // Anything already in Grok that bb hasn't shown (the history on a new thread,
+  // messages typed in the Grok Bot app) lands before this turn's own traffic.
+  // A slow or failed transcript read (the box times reads out, with retries, while the
+  // bot is busy) must not stop or stall the message going out, so wait at most
+  // PRE_SEND_DRAIN_MS; a late drain sees the turn has moved on and emits nothing,
+  // and the follower catches up.
+  await Promise.race([
+    drain().catch(() => 0),
+    new Promise((resolve) => setTimeout(resolve, PRE_SEND_DRAIN_MS)),
+  ]);
   if (turn.cancelled) return;
 
   if (text.startsWith(REGISTER_MARKER)) {
@@ -644,13 +655,21 @@ async function runTurn(args: {
     options.identityHeader === false
       ? text
       : `${identityHeader(agent.name, session.threadId)}\n\n${text}`;
+  let sent: Awaited<ReturnType<typeof sendMessage>>;
   try {
-    await sendMessage(gbot, agentId, outgoing);
+    sent = await sendMessage(gbot, agentId, outgoing);
   } catch (error) {
     if (!turn.cancelled) fail(errorMessage(error));
     return;
   }
   if (turn.cancelled) return;
+  if (sent.delivery === "accepted") {
+    // Delivered. Close the turn now instead of holding it open while the bot works
+    // (up to 30 min): an open turn makes bb reject other agents' tells as competing
+    // turns. The follower mirrors the bot's replies as they arrive.
+    finish(null);
+    return;
+  }
 
   const startedAt = Date.now();
   let sawBusy = false;
